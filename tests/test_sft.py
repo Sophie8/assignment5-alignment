@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 from .adapters import (
     run_compute_entropy as compute_entropy,
