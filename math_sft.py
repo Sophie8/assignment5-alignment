@@ -1,33 +1,15 @@
+from unittest.mock import patch
+import pandas as pd
+from datasets import load_dataset
+
 from typing import Union
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
+import wandb
 import torch
 import torch.nn as nn
 
-'''
-def sft():
-    model = AutoModelForCausalLM.from_pretrained(
-        "/data/a5-alignment/models/Qwen2.5-Math-1.5B",
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        )
-    data_loader = None
-    loss_fn = torch.nn.functional.cross_entropy
-    optimizer = torch.optim.AdamW
-    gradient_accumulation_steps = 4
-    for idx, (inputs, labels) in enumerate(data_loader):
-        # Forward pass.
-        logits = model(inputs)
-        loss = loss_fn(logits, labels) / gradient_accumulation_steps
-        # Backward pass.
-        loss.backward()
-        if (idx + 1) % gradient_accumulation_steps == 0:
-        # Update weights every `gradient_accumulation_steps` batches.
-        optimizer.step()
-        # Zero gradients every `gradient_accumulation_steps` batches.
-        optimizer.zero_grad()
-'''
-
-
+from vllm import LLM
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 def tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer):
     '''
@@ -296,3 +278,132 @@ def sft_microbatch_train_step(
     meta_data = {}
     print("===> ", loss, policy_log_probs.grad)
     return (loss, meta_data)
+
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
+    """
+    Start the inference process, here we use vLLM to hold a model on
+    a GPU separate from the policy.
+    """
+    vllm_set_random_seed(seed)
+    # Monkeypatch from TRL:
+    # https://github.com/huggingface/trl/blob/
+    # 22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py
+    # Patch vLLM to make sure we can
+    # (1) place the vLLM model on the desired device (world_size_patch) and
+    # (2) avoid a test that is not designed for our setting (profiling_patch).
+    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+    profiling_patch = patch(
+    "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+    return_value=None
+    )
+    with world_size_patch, profiling_patch:
+        return LLM(
+            model=model_id,
+            device=device,
+            dtype=torch.bfloat16,
+            enable_prefix_caching=True,
+            gpu_memory_utilization=gpu_memory_utilization,
+            )
+
+def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
+    """
+    Copied from https://github.com/huggingface/trl/blob/
+    22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py#L670.
+    """
+    state_dict = policy.state_dict()
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    llm_model.load_weights(state_dict.items())
+    return llm_model
+                           
+
+def log_generations():
+    # Setup wandb metrics
+    wandb.define_metric("train_step") # the x‑axis for training
+    wandb.define_metric("eval_step") # the x‑axis for evaluation
+    # everything that starts with train/ is tied to train_step
+    wandb.define_metric("train/*", step_metric="train_step")
+    # everything that starts with eval/ is tied to eval_step
+    wandb.define_metric("eval/*", step_metric="eval_step")
+
+def sft(experiment_name: str,
+        path_to_train_dataset: str, 
+        path_to_val_dataset: str, 
+        gradient_accumulation_steps: int,
+        device='cuda'):
+    
+    #Initialize run
+    run = wandb.init(
+        entity=experiment_name,
+        project="math qwen1.5b sft",
+        group="SFT",  # all runs for the experiment in one group
+    )
+    log_generations()
+
+    model_path = "/home/shuyi/.cache/huggingface/hub/models--Qwen--Qwen2.5-Math-1.5B/snapshots/4a83ca6e4526a4f2da3aa259ec36c259f66b2ab2"
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        )
+    vllm_eng = init_vllm(model_path, device, seed=42)
+
+    train_data = load_dataset("parquet", data_files=path_to_train_dataset)
+    val_data = load_dataset("parquet", data_files=path_to_val_dataset)
+    print("total number of train data points: ", train_data)
+    print("total number of validation data points: ", val_data)
+
+    tokenizer = AutoTokenizer.from_pretrained("/home/shuyi/.cache/huggingface/hub/models--Qwen--Qwen2.5-Math-1.5B/snapshots/4a83ca6e4526a4f2da3aa259ec36c259f66b2ab2")
+    train_data = train_data.map(lambda e: tokenize_prompt_and_output(e["prompt"], e["response"], tokenizer), batched=True)
+    train_data.set_format(type='torch', columns=['input_ids', 'labels', 'response_mask'])
+    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=8)
+    
+    val_data = val_data.map(lambda e: tokenize_prompt_and_output(e["prompt"], e["response"], tokenizer), batched=True)
+    val_data.set_format(type='torch', columns=['input_ids', 'labels', 'response_mask'])
+    val_dataloader = torch.utils.data.DataLoader(val_data, batch_size=8)
+    
+
+    #loss_fn = torch.nn.functional.cross_entropy
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+    # Training loop with gradient clipping
+    num_epochs = 2
+    clip_norm = 1.0  # The maximum allowed L2 norm of the gradients
+    for epoch in range(num_epochs):
+        for idx, (inputs, labels, response_masks) in enumerate(train_dataloader):
+            # Forward pass.
+            log_response = get_response_log_probs(model, inputs, labels, return_token_entropy=True)
+            loss, meta_data = sft_microbatch_train_step(log_response["log_probs"], response_masks, gradient_accumulation_steps)
+            # Backward pass.
+            loss.backward()
+            if (idx + 1) % gradient_accumulation_steps == 0:
+                # Perform gradient clipping
+                # This clips the L2 norm of the gradients of all model parameters
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                # Update weights every `gradient_accumulation_steps` batches.
+                optimizer.step()
+                # Zero gradients every `gradient_accumulation_steps` batches.
+                optimizer.zero_grad()
+            run.log({"train/prompt": inputs, "train/labels": labels})
+            run.log(log_response)
+    
+        model.eval()
+        metrics = {"mean_token_accuracy": []}
+        for idx, (inputs, labels, response_masks) in enumerate(val_dataloader):
+            with torch.no_grad():
+                vllm_model = load_policy_into_vllm_instance(model, vllm_eng)
+                outputs = vllm_model(inputs)
+                predictions = torch.argmax(outputs, dim=-1)
+                # Calculate accuracy only on non-padding tokens
+                correct_predictions = (predictions == labels) & response_masks
+                total_tokens = response_masks.sum()
+                correct_tokens = correct_predictions.sum()
+
+                # Compute the mean token accuracy and log it
+                total_sum = total_tokens.sum()
+                accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
+                metrics["mean_token_accuracy"].append(accuracy)
+                run.log({"eval/predictions": predictions, "references": labels})
+                run.log(metrics)
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.4f}") # type: ignore
+        run.log({"Epoch": f"{epoch+1}/{num_epochs}", "Loss": f"{loss.item():.4f}"}) # type: ignore
+
+    run.finish()
