@@ -1,4 +1,6 @@
 from typing import Literal
+import torch.nn.functional as F
+
 import torch
 import numpy as np
 import wandb 
@@ -12,6 +14,25 @@ from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from math_sft import log_generations, init_vllm, tokenize_prompt_and_output, get_response_log_probs
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
+def top_p_filtering(logits, top_p=0.9, filter_value=-float('Inf')):
+    """
+    Filter a distribution of logits using nucleus (top-p) sampling.
+    """
+    # Sort the logits in descending order
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    # Calculate the cumulative probability mass
+    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+    # Create a mask for tokens to remove (cumulative probability is greater than top_p)
+    # Shift the mask to the right to keep the token that causes the cumulative probability to exceed top_p
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = 0
+
+    # Scatter the filtered indices to the original positions in the logits tensor
+    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+    logits[indices_to_remove] = filter_value
+    return logits
 
 def compute_group_normalized_rewards(
     reward_fn,
@@ -67,7 +88,7 @@ def compute_group_normalized_rewards(
         i += 1
     raw_rewards = torch.tensor(raw_rewards, dtype=torch.float32)
     advantages_shapes = torch.tensor(advantages_shapes, dtype=torch.float32)
-    # The dim=1 argument specifies that the mean should be calculated across the rows (the second dimension for a 2D tensor)
+    # The dim=1 argument specifies that the mean should be calculated across the rows = along the columns (the second dimension for a 2D tensor)
     metadata = {}
     # note squeeze only remove dim where dim size is 1, here we need to concatenate all lists to one
     '''
@@ -260,6 +281,51 @@ def grpo_microbatch_train_step(
     return loss_agg, metadata
 
 
+def calculate_grpo_val_metrics(logits, ref_logits, rewards, group_size):
+    """
+    logits: [Batch * G, Seq_Len, Vocab] - Current model output
+    ref_logits: [Batch * G, Seq_Len, Vocab] - Reference model output
+    rewards: [Batch * G] - Scalar rewards for each completion
+    group_size (G): Number of completions per prompt
+    """
+    # 1. Mean Reward & Standard Deviation (Group-Relative)
+    # Reshape rewards to [Batch, G] to calculate statistics within each prompt group
+    rewards = rewards.view(-1, group_size)
+    mean_reward = rewards.mean(dim=1, keepdim=True)
+    std_reward = rewards.std(dim=1, keepdim=True)
+    
+    # Normalized Advantage (for monitoring, though ratio is 1.0)
+    # epsilon prevents division by zero
+    advantages = (rewards - mean_reward) / (std_reward + 1e-8)
+
+    # 2. KL Divergence Calculation (Token-level)
+    # Get log probabilities for current and reference models
+    log_probs = F.log_softmax(logits, dim=-1)
+    ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+    
+    # Calculate Reverse KL: KL(Ref || Current)
+    # Common estimator: exp(log_ref - log_p) - (log_ref - log_p) - 1
+    # Or standard: ref * (log_ref - log_p)
+    kl_per_token = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
+    
+    # Sum over sequence length and mean over the batch
+    # Masking should be applied here if sequences have padding
+    mean_kl = kl_per_token.sum(dim=-1).mean()
+
+    return {
+        "val_mean_reward": mean_reward.mean().item(),
+        "val_std_reward": std_reward.mean().item(),
+        "val_kl_divergence": mean_kl.item()
+    }
+
+'''
+At the start of the training process, you essentially have two identical copies of the same model. They diverge the moment training begins:
+Model	Status	Role
+Policy Model	Active/Trainable	This is the "student." It generates multiple outputs for each prompt, learns from rewards, and updates its weights.
+Reference Model	Frozen	This is the "anchor." It stays exactly as it was at . It provides a baseline probability for every token the student generates.
+Note reward function is used in advantage calculation, where reference model is used in KL Divergence
+Note different from grpo, ppo has its own reward model
+'''
 def grpo_on_policy(experiment_name: str,
                    path_to_train_dataset: str, 
                    path_to_val_dataset: str,
@@ -271,8 +337,8 @@ def grpo_on_policy(experiment_name: str,
     n_grpo_steps: int = 200
     learning_rate: float = 1e-5
     advantage_eps: float = 1e-6
-    rollout_batch_size: int = 256
-    group_size: int = 8
+    rollout_batch_size: int = 256 # Rollout Batch Size = Number of Unique Prompts × Group Size
+    group_size: int = 8 # for each individual prompt, calculate the group level adventage
     sampling_temperature: float = 1.0
     sampling_min_tokens: int = 4 # As in Expiter, disallow empty string responses
     sampling_max_tokens: int = 1024
@@ -280,6 +346,7 @@ def grpo_on_policy(experiment_name: str,
     train_batch_size: int = 256 # On-policy
     gradient_accumulation_steps: int = 128 # microbatch size is 2, will fit on H100
     gpu_memory_utilization: float = 0.85
+    per_device_eval_batch_size = 1
     loss_type: Literal[
         "no_baseline",
         "reinforce_with_baseline",
@@ -292,6 +359,20 @@ def grpo_on_policy(experiment_name: str,
         weight_decay=0.0,
         betas=(0.9, 0.95),
     )
+    # sanity check
+    assert train_batch_size % gradient_accumulation_steps == 0, (
+    "train_batch_size must be divisible by gradient_accumulation_steps"
+    )
+    micro_train_batch_size = train_batch_size // gradient_accumulation_steps
+    assert rollout_batch_size % group_size == 0, (
+    "rollout_batch_size must be divisible by group_size"
+    )
+    n_prompts_per_rollout_batch = rollout_batch_size // group_size
+    assert train_batch_size >= group_size, (
+    "train_batch_size must be greater than or equal to group_size"
+    )
+    n_microbatches_per_rollout_batch = rollout_batch_size // micro_train_batch_size
+
     #Initialize run
     run = wandb.init(
         entity=experiment_name,
@@ -306,7 +387,7 @@ def grpo_on_policy(experiment_name: str,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
         )
-    vllm_eng = init_vllm(model_path, device, seed=42)
+    vllm_eng = init_vllm(model_path, device, seed=42) # host reference model
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
 
     # load datasets
@@ -318,14 +399,14 @@ def grpo_on_policy(experiment_name: str,
     tokenizer = AutoTokenizer.from_pretrained("/home/shuyi/.cache/huggingface/hub/models--Qwen--Qwen2.5-Math-1.5B/snapshots/4a83ca6e4526a4f2da3aa259ec36c259f66b2ab2")
     train_data = train_data.map(lambda e: tokenize_prompt_and_output(e["prompt"], e["response"], tokenizer), batched=True)
     train_data.set_format(type='torch', columns=['input_ids', 'labels', 'response_mask'])
-    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=8)
+    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=n_microbatches_per_rollout_batch)
     
     val_data = val_data.map(lambda e: tokenize_prompt_and_output(e["prompt"], e["response"], tokenizer), batched=True)
     val_data.set_format(type='torch', columns=['input_ids', 'labels', 'response_mask'])
-    val_dataloader = torch.utils.data.DataLoader(val_data, batch_size=8)
-
+    val_dataloader = torch.utils.data.DataLoader(val_data, batch_size=per_device_eval_batch_size)
+    
     # Training loop with gradient clipping
-    num_epochs = 2
+    num_epochs = 1
     clip_norm = 1.0  # The maximum allowed L2 norm of the gradients
     for epoch in range(num_epochs):
         for idx, (inputs, labels, response_masks) in enumerate(train_dataloader):
@@ -337,8 +418,11 @@ def grpo_on_policy(experiment_name: str,
                                                                           group_size,
                                                                           advantage_eps,
                                                                           normalize_by_std=True)
+            # vllm for old log probs
+            _, __, old_log_probs, extra_fields = vllm_eng.generate(prompts=inputs, num_generations=1)                                                           
             loss, meta_data = grpo_microbatch_train_step(log_response["log_probs"], 
-                                                         response_masks,                     gradient_accumulation_steps, 
+                                                         response_masks,                     
+                                                         gradient_accumulation_steps, 
                                                          loss_type, 
                                                          advantages,
                                                          raw_rewards, 
@@ -356,3 +440,25 @@ def grpo_on_policy(experiment_name: str,
                 optimizer.zero_grad()
             run.log({"train/prompt": inputs, "train/labels": labels})
             run.log(log_response)
+        run.log({"train/epoch": epoch, "train/loss": loss.item()})
+        if ((epoch+1) % val_interval) == 0:
+            model.eval()
+            with torch.no_grad():
+                for x, truth in val_dataloader:
+                    x = x.to_device(x)
+                    truth = truth.to_device(y)
+                    logits = model(x)
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    # decode logits to rollouts
+                    predicted_token_ids = top_p_filtering(logits, top_p=0.9)
+                    rollout = tokenizer.decode(predicted_token_ids.item())
+                    # calculate reward
+                    rewards = r1_zero_reward_fn(rollout, truth)
+                    # vllm for old log probs
+                    _, __, ref_log_probs, extra_fields = vllm_eng.generate(prompts=x, num_generations=1)
+                    metrics = calculate_grpo_val_metrics(log_probs, ref_log_probs, rewards, per_device_eval_batch_size)
+                    run.log({"eval/epoch": epoch, "eval/metrics": metrics})
+        
+
+
+
